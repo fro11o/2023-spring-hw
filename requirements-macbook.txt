@@ -4,3 +4,5 @@ torchvision==0.21.0
 matplotlib==3.9.4
 numpy==2.0.2
 pandas==2.2.3
+kaggle==1.7.4.2
+notebook==7.4.0
