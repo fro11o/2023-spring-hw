@@ -15,26 +15,26 @@ import argparse
 gym.register_envs(ale_py)
 
 # Training hyperparameters
-learning_rate = 1e-4 # How fast to learn (higher = faster but less stable)
+learning_rate = 1e-5 # How fast to learn (higher = faster but less stable)
 # n_episodes = 100_000  # Number of hands to practice
-n_episodes = 3_000  # Number of hands to practice
-start_epsilon = 0.1  # Start with 100% random actions
-epsilon_decay = start_epsilon / n_episodes  # Reduce exploration over time
-final_epsilon = 0.1  # Always keep some exploration
+n_episodes = 50_000  # Number of hands to practice
+start_epsilon = 1.0  # Start with 100% random actions
+final_epsilon = 0.1
+epsilon_decay = (start_epsilon - final_epsilon) / n_episodes  # Decay over 100,000 steps
 
 
 class DQN(nn.Module):
     def __init__(self, input_shape, n_actions):
         super(DQN, self).__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, stride=2),
+            nn.Conv2d(input_shape[0], 32, kernel_size=8, stride=4),
             nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=3, stride=2),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
             nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=2),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
             nn.ReLU(),
             nn.Flatten(),
-            nn.Linear(64 * 25 * 19, 512),  # <-- fix output size here!
+            nn.Linear(64 * 7 * 7, 512),
             nn.ReLU(),
             nn.Linear(512, n_actions)
         )
@@ -45,9 +45,9 @@ class DQN(nn.Module):
 Transition = namedtuple('Transition', ('state', 'action', 'reward', 'next_state', 'done'))
 
 class DQNAgent:
-    def __init__(self, env, learning_rate, initial_epsilon, epsilon_decay, final_epsilon, buffer_size=10000, batch_size=32, gamma=0.99):
+    def __init__(self, env, learning_rate, initial_epsilon, epsilon_decay, final_epsilon, buffer_size=100000, batch_size=32, gamma=0.99):
         self.env = env
-        obs_shape = (3, 210, 160)
+        obs_shape = (4, 84, 84)
         self.n_actions = env.action_space.n
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.policy_net = DQN(obs_shape, self.n_actions).to(self.device)
@@ -136,27 +136,59 @@ def get_moving_avgs(arr, window, convolution_mode):
 
 
 def preprocess_obs(obs):
-    # Normalize to [0,1]
-    obs = obs.astype(np.float32) / 255.0
-    return obs.transpose(2, 0, 1)  # shape: (3, 210, 160)
+    # Convert to grayscale and resize to 84x84
+    obs_gray = np.mean(obs, axis=2).astype(np.uint8)
+    obs_resized = resize(obs_gray, (84, 84), anti_aliasing=True, preserve_range=True).astype(np.uint8)
+    obs_resized = obs_resized.astype(np.float32) / 255.0
+    return obs_resized  # shape: (84, 84)
 
+
+class FrameStack:
+    def __init__(self, k):
+        self.k = k
+        self.frames = deque([], maxlen=k)
+
+    def reset(self, obs):
+        processed = preprocess_obs(obs)
+        for _ in range(self.k):
+            self.frames.append(processed)
+        return np.stack(self.frames, axis=0)  # shape: (k, 84, 84)
+
+    def step(self, obs):
+        processed = preprocess_obs(obs)
+        self.frames.append(processed)
+        return np.stack(self.frames, axis=0)
+
+
+frame_stack = FrameStack(4)
+
+frame_skip = 4  # Repeat each action for 4 frames
 
 def train(env: gym.Env):
+    learning_starts = 10000  # Start updating after 10,000 steps
     for episode in tqdm(range(n_episodes)):
         obs, info = env.reset()
-        obs = preprocess_obs(obs)
+        obs = frame_stack.reset(obs)
         done = False
         episode_reward = 0
         while not done:
             action = agent.get_action(obs)
-            next_obs, reward, terminated, truncated, info = env.step(action)
-            next_obs = preprocess_obs(next_obs)
-            done_flag = terminated or truncated
-            agent.store_transition(obs, action, reward, next_obs, done_flag)
-            agent.update()
+            total_reward = 0
+            for _ in range(frame_skip):
+                next_obs, reward, terminated, truncated, info = env.step(action)
+                total_reward += np.clip(reward, -1, 1)
+                done_flag = terminated or truncated
+                if done_flag:
+                    break
+            next_obs = frame_stack.step(next_obs)
+            agent.store_transition(obs, action, total_reward, next_obs, done_flag)
+            # Only update after learning_starts steps
+            if agent.steps > learning_starts:
+                agent.update()
+            agent.steps += 1
             obs = next_obs
             done = done_flag
-            episode_reward += reward
+            episode_reward += total_reward
         print(f"Episode Reward: {episode_reward}")
         agent.decay_epsilon()
 
@@ -211,14 +243,14 @@ def test_agent(env: gym.Env, num_episodes=1):
 
     for _ in range(num_episodes):
         obs, info = env.reset()
-        obs = preprocess_obs(obs)
+        obs = frame_stack.reset(obs)
         episode_reward = 0
         done = False
 
         while not done:
             action = agent.get_action(obs)
             next_obs, reward, terminated, truncated, info = env.step(action)
-            next_obs = preprocess_obs(next_obs)
+            next_obs = frame_stack.step(next_obs)
             obs = next_obs
             episode_reward += reward
             done = terminated or truncated
@@ -254,11 +286,11 @@ def main():
         load_agent(agent, args.init_weights)
 
     if args.eval:
-        test_agent(env_test, num_episodes=5)
+        test_agent(env_test, num_episodes=1)
     else:
         train(env_train)
         save_agent(agent)
-        test_agent(env_test, num_episodes=5)
+        test_agent(env_test, num_episodes=1)
         visualize(env_train)
 
 if __name__ == "__main__":
